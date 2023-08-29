@@ -19,3 +19,7 @@
 /.cproject
 /.settings/
 /tools/change_license.pl
+.vscode/
+CMakeLists.txt.user
+build/*
+
