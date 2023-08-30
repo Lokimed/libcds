@@ -8,6 +8,9 @@
 
 #include <exception>
 #include <cds/gc/details/hp_common.h>
+#include <cds/gc/details/tls_managers.h>
+#include <cds/gc/details/hp_client_record.h>
+#include <cds/gc/details/hp_smr_common.h>
 #include <cds/threading/model.h>
 #include <cds/details/throw_exception.h>
 #include <cds/details/marked_ptr.h>
@@ -66,29 +69,14 @@ namespace cds { namespace gc {
             using namespace cds::gc::hp::common;
 
             /// \p smr::scan() strategy
-            enum scan_type {
-                classic,    ///< classic scan as described in Michael's works (see smr::classic_scan())
-                inplace     ///< inplace scan without allocation (see smr::inplace_scan())
-            };
+            typedef smr_common_data::scan_type scan_type;
 
             //@cond
             /// Hazard Pointer SMR (Safe Memory Reclamation)
             class basic_smr {
                 template<typename TLSManager>
                 friend class generic_smr;
-                struct thread_record: thread_data
-                {
-                    // next hazard ptr record in list
-                    thread_record*                      next_ = nullptr;
-                    // Owner thread_record; nullptr - the record is free (not owned)
-                    atomics::atomic<thread_record*>  owner_rec_;
-                    // true if record is free (not owned)
-                    atomics::atomic<bool>               free_{ false };
-
-                    thread_record( guard* guards, size_t guard_count, retired_ptr* retired_arr, size_t retired_capacity )
-                            : thread_data( guards, guard_count, retired_arr, retired_capacity ), owner_rec_(this)
-                    {}
-                };
+                typedef client_record thread_record;
 
             public:
                 /// Returns the instance of Hazard Pointer \ref basic_smr
@@ -120,7 +108,7 @@ namespace cds { namespace gc {
                         size_t nHazardPtrCount = 0,     ///< Hazard pointer count per thread
                         size_t nMaxThreadCount = 0,     ///< Max count of simultaneous working thread in your application
                         size_t nMaxRetiredPtrCount = 0, ///< Capacity of the array of retired objects for the thread
-                        scan_type nScanType = inplace   ///< Scan type (see \ref scan_type enum)
+                        scan_type nScanType = scan_type::inplace   ///< Scan type (see \ref scan_type enum)
                 );
 
                 // for back-copatibility
@@ -128,7 +116,7 @@ namespace cds { namespace gc {
                         size_t nHazardPtrCount = 0,     ///< Hazard pointer count per thread
                         size_t nMaxThreadCount = 0,     ///< Max count of simultaneous working thread in your application
                         size_t nMaxRetiredPtrCount = 0, ///< Capacity of the array of retired objects for the thread
-                        scan_type nScanType = inplace   ///< Scan type (see \ref scan_type enum)
+                        scan_type nScanType = scan_type::inplace   ///< Scan type (see \ref scan_type enum)
                 ) {
                     construct(nHazardPtrCount, nMaxThreadCount, nMaxRetiredPtrCount, nScanType);
                 }
@@ -995,8 +983,8 @@ namespace cds { namespace gc {
         public:
             /// \p scan() type
             enum class scan_type {
-                classic = hp::details::classic,    ///< classic scan as described in Michael's papers
-                inplace = hp::details::inplace     ///< inplace scan without allocation
+                classic = hp::details::scan_type::classic,    ///< classic scan as described in Michael's papers
+                inplace = hp::details::scan_type::inplace     ///< inplace scan without allocation
             };
 
             /// Initializes %HP singleton

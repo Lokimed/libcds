@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
+set (CMAKE_CXX_STANDARD 17)
 
 cmake_policy(SET CMP0016 NEW)
 if(POLICY CMP0042)
@@ -7,6 +8,7 @@ endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/build/cmake ${CMAKE_MODULE_PATH})
 include(TargetArch)
+message("TargetArch ${TargetArch}")
 include(CheckIncludeFileCXX)
 
 project(cds)
@@ -14,7 +16,11 @@ project(cds)
 set(PROJECT_VERSION 2.3.3)
 
 # Options
-option(LIBCDS_WITH_TESTS "Build unit tests" OFF)
+
+# TODO (FIXME)
+# Gtest now suppor only c++ gigher or equal that 14.
+# So need have local gtest in repository or fix tests for new version gtest
+option(LIBCDS_WITH_TESTS "Build unit tests" ON)
 option(LIBCDS_WITH_TESTS_COVERAGE "Analyze test coverage using gcov (only for gcc)" OFF)
 option(LIBCDS_WITH_BOOST_ATOMIC "Use boost atomics (only for boost >= 1.54)" OFF)
 option(LIBCDS_WITH_ASAN "Build ASan+UBSan instrumented code" OFF)
@@ -158,17 +164,7 @@ message("Exe flags: ${CMAKE_EXE_LINKER_FLAGS}")
 set(LIBRARIES_COMPONENT lib)
 set(HEADERS_COMPONENT devel)
 
-set(SOURCES src/init.cpp
-            src/hp.cpp
-            src/hp_thread_local.cpp
-            src/dhp.cpp
-            src/urcu_gp.cpp
-            src/urcu_sh.cpp
-            src/thread_data.cpp
-            src/topology_hpux.cpp
-            src/topology_linux.cpp
-            src/topology_osx.cpp
-            src/dllmain.cpp)
+file(GLOB_RECURSE SOURCES src/*.cpp)
 
 add_library(${CDS_SHARED_LIBRARY} SHARED ${SOURCES})
 set_target_properties(${CDS_SHARED_LIBRARY} PROPERTIES VERSION ${PROJECT_VERSION}
@@ -205,6 +201,7 @@ endif()
 install(EXPORT LibCDSConfig FILE LibCDSConfig.cmake NAMESPACE LibCDS:: DESTINATION lib/cmake/LibCDS)
 install(DIRECTORY ${PROJECT_SOURCE_DIR}/cds DESTINATION include COMPONENT ${HEADERS_COMPONENT})
 
+message("LIBCDS_WITH_TESTS ${LIBCDS_WITH_TESTS}")
 if(LIBCDS_WITH_TESTS)
     enable_testing()
     add_subdirectory(${PROJECT_SOURCE_DIR}/test)

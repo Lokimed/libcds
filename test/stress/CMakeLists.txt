@@ -1,3 +1,9 @@
+message("____________________________________")
+set (CMAKE_CXX_STANDARD 17)
+message("CXX_STANDARD ${CXX_STANDARD}")
+message("CMAKE_CXX_STANDARD ${CMAKE_CXX_STANDARD}")
+message("____________________________________")
+
 set(CDSSTRESS_FRAMEWORK_LIBRARY stress-framework)
 
 set(CDSSTRESS_FRAMEWORK_SOURCES

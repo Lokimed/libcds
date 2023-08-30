@@ -155,6 +155,7 @@ if(LIBCDS_ENABLE_UNIT_TEST)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/unit)
 endif()
 if(LIBCDS_ENABLE_STRESS_TEST)
+    message("stress tests enabled")
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/stress)
 endif()
 

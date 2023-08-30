@@ -7,8 +7,10 @@
 #include <vector>
 
 #include <cds/gc/hp.h>
+#include <cds/gc/details/hp_scan_functions.h>
 #include <cds/os/thread.h>
 #include <cds/gc/hp_membar.h>
+#include <cds/gc/details/hp_default_memory_allocator.h>
 
 #if CDS_OS_TYPE == CDS_OS_LINUX
 #   include <unistd.h>
@@ -68,15 +70,6 @@ namespace cds { namespace gc { namespace hp { namespace details {
 #endif
 
     namespace {
-        void * default_alloc_memory( size_t size )
-        {
-            return new uintptr_t[( size + sizeof( uintptr_t ) - 1 ) / sizeof( uintptr_t) ];
-        }
-
-        void default_free_memory( void* p )
-        {
-            delete[] reinterpret_cast<uintptr_t*>( p );
-        }
 
         void* ( *s_alloc_memory )( size_t size ) = default_alloc_memory;
         void ( *s_free_memory )( void* p ) = default_free_memory;
@@ -103,6 +96,7 @@ namespace cds { namespace gc { namespace hp { namespace details {
             }
         };
 
+        // TODO delete this in future
         struct defaults {
             static const size_t c_nHazardPointerPerThread = 8;
             static const size_t c_nMaxThreadCount = 100;
@@ -156,7 +150,7 @@ namespace cds { namespace gc { namespace hp { namespace details {
         , max_thread_count_( nMaxThreadCount == 0 ? defaults::c_nMaxThreadCount : nMaxThreadCount )
         , max_retired_ptr_count_( calc_retired_size( nMaxRetiredPtrCount, hazard_ptr_count_, max_thread_count_ ))
         , scan_type_( nScanType )
-        , scan_func_( nScanType == classic ? &basic_smr::classic_scan : &basic_smr::inplace_scan )
+        , scan_func_( nScanType == scan_type::classic ? &basic_smr::classic_scan : &basic_smr::inplace_scan )
     {
         thread_list_.store( nullptr, atomics::memory_order_release );
     }
@@ -190,38 +184,7 @@ namespace cds { namespace gc { namespace hp { namespace details {
 
     CDS_EXPORT_API basic_smr::thread_record* basic_smr::create_thread_data()
     {
-        size_t const guard_array_size = thread_hp_storage::calc_array_size( get_hazard_ptr_count());
-        size_t const retired_array_size = retired_array::calc_array_size( get_max_retired_ptr_count());
-        size_t const nSize = sizeof( thread_record ) + guard_array_size + retired_array_size;
-
-        /*
-            The memory is allocated by contnuous block
-            Memory layout:
-            +--------------------------+
-            |                          |
-            | thread_record            |
-            |         hazards_         +---+
-        +---|         retired_         |   |
-        |   |                          |   |
-        |   |--------------------------|   |
-        |   | hazard_ptr[]             |<--+
-        |   |                          |
-        |   |                          |
-        |   |--------------------------|
-        +-->| retired_ptr[]            |
-            |                          |
-            |                          |
-            +--------------------------+
-        */
-
-        uint8_t* mem = reinterpret_cast<uint8_t*>( s_alloc_memory( nSize ));
-
-        return new( mem ) thread_record(
-            reinterpret_cast<guard*>( mem + sizeof( thread_record )),
-            get_hazard_ptr_count(),
-            reinterpret_cast<retired_ptr*>( mem + sizeof( thread_record ) + guard_array_size ),
-            get_max_retired_ptr_count()
-        );
+        return details::create_client_data(get_hazard_ptr_count(), get_max_retired_ptr_count(), s_alloc_memory);
     }
 
     /*static*/ CDS_EXPORT_API void basic_smr::destroy_thread_data(thread_record* pRec )
@@ -236,28 +199,7 @@ namespace cds { namespace gc { namespace hp { namespace details {
 
     CDS_EXPORT_API basic_smr::thread_record* basic_smr::alloc_thread_data()
     {
-        thread_record * hprec;
-
-        // First try to reuse a free (non-active) HP record
-        for ( hprec = thread_list_.load( atomics::memory_order_acquire ); hprec; hprec = hprec->next_ ) {
-            thread_record* null_rec = nullptr;
-            if ( !hprec->owner_rec_.compare_exchange_strong( null_rec, hprec, atomics::memory_order_relaxed, atomics::memory_order_relaxed ))
-                continue;
-            hprec->free_.store( false, atomics::memory_order_release );
-            return hprec;
-        }
-
-        // No HP records available for reuse
-        // Allocate and push a new HP record
-        hprec = create_thread_data();
-        hprec->owner_rec_.store( hprec, atomics::memory_order_relaxed );
-
-        thread_record* pOldHead = thread_list_.load( atomics::memory_order_relaxed );
-        do {
-            hprec->next_ = pOldHead;
-        } while ( !thread_list_.compare_exchange_weak( pOldHead, hprec, atomics::memory_order_release, atomics::memory_order_acquire ));
-
-        return hprec;
+        return details::alloc_thread_data(thread_list_, get_hazard_ptr_count(), get_max_retired_ptr_count(), s_alloc_memory);
     }
 
     CDS_EXPORT_API void basic_smr::free_thread_data(basic_smr::thread_record* pRec, bool callHelpScan )
@@ -283,170 +225,55 @@ namespace cds { namespace gc { namespace hp { namespace details {
         }
     }
 
-    CDS_EXPORT_API void basic_smr::inplace_scan(thread_data* pThreadRec )
+    namespace
     {
-        thread_record* pRec = static_cast<thread_record*>( pThreadRec );
+        using VectorVoid = std::vector< void*, allocator<void*>>;
 
-        //CDS_HAZARDPTR_STATISTIC( ++m_Stat.m_ScanCallCount )
-
-        // In-place scan algo uses LSB of retired ptr as a mark for internal purposes.
-        // It is correct if all retired pointers are ar least 2-byte aligned (LSB is zero).
-        // If it is wrong, we use classic scan algorithm
-
-        // Check if all retired pointers has zero LSB
-        // LSB is used for marking pointers that cannot be deleted yet
-        retired_ptr* first_retired = pRec->retired_.first();
-        retired_ptr* last_retired = pRec->retired_.last();
-        if ( first_retired == last_retired )
-            return;
-
-        for ( auto it = first_retired; it != last_retired; ++it ) {
-            if ( it->m_n & 1 ) {
-                // found a pointer with LSB bit set - use classic_scan
-                classic_scan( pRec );
-                return;
-            }
-        }
-
-        CDS_HPSTAT( ++pThreadRec->scan_count_ );
-
-        // Sort retired pointer array
-        std::sort( first_retired, last_retired, retired_ptr::less );
-
-        // Check double free
-#   ifdef _DEBUG
+        VectorVoid createVectorWithCustomAllocator(size_t thread_count, size_t hazard_ptr_count)
         {
-            auto it = first_retired;
-            auto itPrev = it;
-            while ( ++it != last_retired ) {
-                assert( itPrev->m_p < it->m_p );
-                itPrev = it;
-            }
-        }
-#   endif
+            VectorVoid plist;
+            plist.reserve( thread_count * hazard_ptr_count);
+            return plist;    
+        }    
+    }
+    
 
-        // Search guarded pointers in retired array
-        thread_record* pNode = thread_list_.load( atomics::memory_order_acquire );
-
+    CDS_EXPORT_API void basic_smr::classic_scan(thread_data *pRec)
+    {
+        details::HpMechanizmPart hp_data{pRec, thread_list_};
+        auto thread_count = get_max_thread_count();
+        auto hazard_ptr_count = get_hazard_ptr_count();
+        
+        auto vector_creator = [thread_count, hazard_ptr_count]() -> VectorVoid
         {
-            retired_ptr dummy_retired;
-            while ( pNode ) {
-                if ( pNode->owner_rec_.load( atomics::memory_order_relaxed ) != nullptr ) {
-                    thread_hp_storage& hpstg = pNode->hazards_;
-
-                    for ( auto hp = hpstg.begin(), end = hpstg.end(); hp != end; ++hp ) {
-                        void * hptr = hp->get( atomics::memory_order_relaxed );
-                        if ( hptr ) {
-                            dummy_retired.m_p = hptr;
-                            retired_ptr* it = std::lower_bound(first_retired, last_retired, dummy_retired, retired_ptr::less);
-                            if ( it != last_retired && it->m_p == hptr ) {
-                                // Mark retired pointer as guarded
-                                it->m_n |= 1;
-                            }
-                        }
-                    }
-                }
-                pNode = pNode->next_;
-            }
-        }
-
-        // Move all marked pointers to head of array
-        {
-            retired_ptr* insert_pos = first_retired;
-            for ( retired_ptr* it = first_retired; it != last_retired; ++it ) {
-                if ( it->m_n & 1 ) {
-                    it->m_n &= ~uintptr_t(1);
-                    if ( insert_pos != it )
-                        *insert_pos = *it;
-                    ++insert_pos;
-                }
-                else {
-                    // Retired pointer may be freed
-                    it->free();
-                    CDS_HPSTAT( ++pRec->free_count_ );
-                }
-            }
-            const size_t nDeferred = insert_pos - first_retired;
-            pRec->retired_.reset( nDeferred );
-        }
+            return createVectorWithCustomAllocator(thread_count, hazard_ptr_count);
+        };
+        
+        details::classic_scan<VectorVoid>(hp_data, std::move(vector_creator));
     }
 
-    // cppcheck-suppress functionConst
-    CDS_EXPORT_API void basic_smr::classic_scan(thread_data* pThreadRec )
+    CDS_EXPORT_API void basic_smr::help_scan(thread_data *pThis)
     {
-        thread_record* pRec = static_cast<thread_record*>( pThreadRec );
+        assert(static_cast<thread_record *>(pThis)->owner_rec_.load(atomics::memory_order_relaxed) == static_cast<thread_record *>(pThis));
 
-        CDS_HPSTAT( ++pThreadRec->scan_count_ );
+        CDS_HPSTAT(++pThis->help_scan_count_);
 
-        std::vector< void*, allocator<void*>>   plist;
-        plist.reserve( get_max_thread_count() * get_hazard_ptr_count());
-        assert( plist.size() == 0 );
-
-        // Stage 1: Scan HP list and insert non-null values in plist
-
-        thread_record* pNode = thread_list_.load( atomics::memory_order_acquire );
-
-        while ( pNode ) {
-            if ( pNode->owner_rec_.load( std::memory_order_relaxed ) != nullptr ) {
-                for ( size_t i = 0; i < get_hazard_ptr_count(); ++i ) {
-                    void * hptr = pNode->hazards_[i].get();
-                    if ( hptr )
-                        plist.push_back( hptr );
-                }
-            }
-            pNode = pNode->next_;
-        }
-
-        // Sort plist to simplify search in
-        std::sort( plist.begin(), plist.end());
-
-        // Stage 2: Search plist
-        retired_array& retired = pRec->retired_;
-
-        retired_ptr* first_retired = retired.first();
-        retired_ptr* last_retired = retired.last();
-
+        for (thread_record *hprec = thread_list_.load(atomics::memory_order_acquire); hprec; hprec = hprec->next_)
         {
-            auto itBegin = plist.begin();
-            auto itEnd = plist.end();
-            retired_ptr* insert_pos = first_retired;
-            for ( retired_ptr* it = first_retired; it != last_retired; ++it ) {
-                if ( std::binary_search( itBegin, itEnd, first_retired->m_p )) {
-                    if ( insert_pos != it )
-                        *insert_pos = *it;
-                    ++insert_pos;
-                }
-                else {
-                    it->free();
-                    CDS_HPSTAT( ++pRec->free_count_ );
-                }
-            }
-
-            retired.reset( insert_pos - first_retired );
-        }
-    }
-
-    CDS_EXPORT_API void basic_smr::help_scan(thread_data* pThis )
-    {
-        assert( static_cast<thread_record*>( pThis )->owner_rec_.load( atomics::memory_order_relaxed ) == static_cast<thread_record*>( pThis ));
-
-        CDS_HPSTAT( ++pThis->help_scan_count_ );
-
-        for ( thread_record* hprec = thread_list_.load( atomics::memory_order_acquire ); hprec; hprec = hprec->next_ )
-        {
-            if ( hprec == static_cast<thread_record*>( pThis ))
+            if (hprec == static_cast<thread_record *>(pThis))
                 continue;
 
             // If free_ == true then hprec->retired_ is empty - we don't need to see it
-            if ( hprec->free_.load( atomics::memory_order_acquire ))
+            if (hprec->free_.load(atomics::memory_order_acquire))
                 continue;
 
             // Owns hprec if it is empty.
             // Several threads may work concurrently so we use atomic technique only.
             {
-                thread_record* curOwner = hprec->owner_rec_.load( atomics::memory_order_relaxed );
-                if ( curOwner == nullptr ) {
-                    if ( !hprec->owner_rec_.compare_exchange_strong( curOwner, hprec, atomics::memory_order_acquire, atomics::memory_order_relaxed ))
+                thread_record *curOwner = hprec->owner_rec_.load(atomics::memory_order_relaxed);
+                if (curOwner == nullptr)
+                {
+                    if (!hprec->owner_rec_.compare_exchange_strong(curOwner, hprec, atomics::memory_order_acquire, atomics::memory_order_relaxed))
                         continue;
                 }
                 else
@@ -455,24 +282,39 @@ namespace cds { namespace gc { namespace hp { namespace details {
 
             // We own the thread record successfully. Now, we can see whether it has retired pointers.
             // If it has ones then we move them to pThis that is private for current thread.
-            retired_array& src = hprec->retired_;
-            retired_array& dest = pThis->retired_;
-            assert( !dest.full());
+            retired_array &src = hprec->retired_;
+            retired_array &dest = pThis->retired_;
+            assert(!dest.full());
 
-            retired_ptr* src_first = src.first();
-            retired_ptr* src_last = src.last();
+            retired_ptr *src_first = src.first();
+            retired_ptr *src_last = src.last();
 
-            for ( ; src_first != src_last; ++src_first ) {
-                if ( !dest.push( std::move( *src_first )))
-                    scan( pThis );
+            for (; src_first != src_last; ++src_first)
+            {
+                if (!dest.push(std::move(*src_first)))
+                    scan(pThis);
             }
 
             src.interthread_clear();
-            hprec->free_.store( true, atomics::memory_order_release );
-            hprec->owner_rec_.store( nullptr, atomics::memory_order_release );
+            hprec->free_.store(true, atomics::memory_order_release);
+            hprec->owner_rec_.store(nullptr, atomics::memory_order_release);
 
-            scan( pThis );
+            scan(pThis);
         }
+    }
+
+    CDS_EXPORT_API void basic_smr::inplace_scan(thread_data* pThreadRec )
+    {
+        details::HpMechanizmPart hp_data{pThreadRec, thread_list_};
+        auto thread_count = get_max_thread_count();
+        auto hazard_ptr_count = get_hazard_ptr_count();
+
+        auto vector_creator = [thread_count, hazard_ptr_count](void) -> VectorVoid
+        {
+            return createVectorWithCustomAllocator(thread_count, hazard_ptr_count);
+        };
+        
+        details::inplace_scan<VectorVoid>(hp_data, std::move(vector_creator));
     }
 
     CDS_EXPORT_API void basic_smr::statistics(stat& st )
